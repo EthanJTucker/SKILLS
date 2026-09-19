@@ -97,7 +97,7 @@ panel for the headline). See Section 6.
 ## 2. Worktrees and isolation
 
 - **Coding agents** work on a branch worktree: `git worktree add <path> -b
-  issue-N-<slug> origin/main` under `.claude\worktrees\`.
+  issue-N-<slug> origin/main` under `.claude/worktrees/`.
 - **Reviewers and fix-verifiers** work on a *detached* worktree at the PR head:
   `git worktree add --detach <path> origin/<branch>`. Treat it read-only for
   git; copy to a temp dir for any experiment that mutates files.
@@ -128,36 +128,46 @@ The division of labor that works:
 
 - **The agent builds and launches, then hands compute back to you.** A coding
   or fix agent writes the code, commits it, launches the long run **detached
-  with file-redirected logs**, reports the PID and the exact rerun command, and
-  ends its turn. It does not try to wait.
+  with file-redirected logs**, reports the PID (or job handle) and the exact
+  rerun command, and ends its turn. It does not try to wait.
 - **You, the orchestrator, babysit the compute.** You can poll across turns. Use
   a background watcher that waits for the process to exit and tails its logs,
   then dispatch a *finisher* agent to validate outputs, commit artifacts, and
   open/update the PR.
 
-Launch pattern (PowerShell, Windows):
+Launch pattern — adapt to your OS/shell; the requirements are the same either
+way: detach it, redirect both streams to files, and capture the PID.
 
+PowerShell:
 ```powershell
-$p = Start-Process -FilePath "<wt>\.venv\Scripts\python.exe" `
+$p = Start-Process -FilePath "<interpreter>" `
   -ArgumentList "-u","scripts\analyze.py","--records","<abs path>","--out","results\v1" `
-  -WorkingDirectory "<wt>" `
-  -RedirectStandardOutput "$env:TEMP\job.out.log" `
-  -RedirectStandardError  "$env:TEMP\job.err.log" -PassThru
+  -WorkingDirectory "<worktree>" `
+  -RedirectStandardOutput "<log dir>\job.out.log" `
+  -RedirectStandardError  "<log dir>\job.err.log" -PassThru
 $p.Id
 ```
 
+POSIX shell:
+```bash
+nohup <interpreter> -u scripts/analyze.py --records <abs path> --out results/v1 \
+  > <log dir>/job.out.log 2> <log dir>/job.err.log &
+echo $!
+```
+
 Rules that prevent silent loss:
-- **Never pipe a long job's stdout** into the tool call — Windows buffers it and
-  a broken pipe kills the job. Redirect to files.
-- **`-u`** (unbuffered) plus periodic progress prints so the log shows liveness.
+- **Never pipe a long job's stdout** into the tool call itself — a broken pipe
+  or a buffering shell can kill the job. Redirect to files instead.
+- **Unbuffered output** (e.g. `-u` for Python) plus periodic progress prints so
+  the log shows liveness.
 - A watcher must emit on **every terminal state**, not just success — a filter
   that greps only the happy-path marker is silent through a crash, which looks
   identical to "still running."
 - **Prove determinism before committing results:** run the analysis twice into
-  separate out-dirs and SHA-256 compare. Byte-identical JSON is the bar. Note
-  the caveat that some file formats are not hash-stable across processes
-  (e.g. `.safetensors` header key order) — verify at the tensor/JSON level, not
-  the file-bytes level.
+  separate out-dirs and hash-compare (e.g. SHA-256). Byte-identical output is
+  the bar. Note the caveat that some serialization formats are not hash-stable
+  across processes (e.g. header key order can vary) — verify at the
+  semantic/JSON level, not the raw file-bytes level.
 
 ---
 
@@ -172,9 +182,10 @@ context. Include, in order:
    This one paragraph prevents the confusion failure mode.
 2. **The issue body verbatim** — its scope and acceptance criteria, unedited.
    Name what is explicitly out of scope (the next issue's territory).
-3. **Environment setup** — exact venv recipe, which interpreter to use, which
-   env *never* to touch, and a note that pip/pytest output buffers on Windows
-   so "silent" is not "hung."
+3. **Environment setup** — exact setup/build recipe, which interpreter or
+   toolchain to use, which shared environment *never* to touch, and a note
+   that some shells and OSes buffer subprocess output, so "silent" is not
+   "hung."
 4. **The detached-compute rules** from Section 3 if the issue involves a long
    run, including the explicit "do not yield while it runs; hand compute back."
 5. **Codebase contracts** — the API signatures, data invariants, and "read the
@@ -283,8 +294,10 @@ finding. Borrow all of it into the briefs.
   labels, a flipped sign) returns a detectably wrong value. Research code rarely
   crashes; it produces plausible wrong numbers, and these are the tests that
   catch that. Full test suite green before any push.
-- requirements.txt is frozen; new dev/test deps go in requirements-dev.txt,
-  pinned to the exact resolved version with a one-line justifying comment.
+- Your locked dependency manifest (requirements.txt, package-lock.json,
+  Cargo.lock, etc.) is frozen; new dev/test-only deps go in a separate
+  dev-manifest, pinned to the exact resolved version with a one-line
+  justifying comment.
 - NEVER add Co-Authored-By trailers or any AI attribution, in commits OR PR
   bodies. (Design decisions are the human's; the agent is a power tool.)
 - No secrets, no absolute local paths, no interview/planning/deadline
@@ -295,9 +308,9 @@ finding. Borrow all of it into the briefs.
   iteration order. No wall-clock or randomness in outputs.
 - Never bypass pre-commit hooks (--no-verify). If a hook fails for an
   environment reason, diagnose and report; do not skip it.
-- Do not touch: requirements.txt, data/ (frozen-dataset byte integrity is
-  load-bearing), .github/workflows/, .pre-commit-config.yaml — unless the issue
-  is explicitly about them.
+- Do not touch: the locked dependency manifest, frozen/fixture data whose byte
+  integrity is load-bearing, CI workflow config, or pre-commit/lint config —
+  unless the issue is explicitly about them.
 - Commit bottom-up (helpers + tests -> integration -> generated artifacts).
   Do not try to minimize commit count on the branch — the PR is squash-merged,
   so every working commit collapses into one commit on main at merge. Commit as
@@ -365,29 +378,30 @@ These recurred; reviewers should look for them by default.
 
 ## 10. CI requirements
 
-The pipeline (`.github/workflows/ci.yml`) has one required job and three
-advisory ones. A PR is not merge-ready until CI is green.
+Treat CI status as a hard input to the merge decision, not a formality. A PR is
+not merge-ready until the pipeline you actually rely on is green.
 
-- **`tests` — REQUIRED** (branch protection points here). Installs
-  `requirements.txt` with `--extra-index-url https://download.pytorch.org/whl/cu126`
-  (CUDA wheels install and import fine on the CPU runner), then
-  `requirements-dev.txt`, then runs `pytest`. The required job means torch-level
-  tests actually run on the runner. Confirm it passes before recommending merge.
-- **`lint` (ruff), `pylint`, `security` (pip-audit) — ADVISORY**
-  (`continue-on-error: true`). They report without blocking while the codebase
-  is brought clean under each tool. Flip one to required (remove
-  `continue-on-error`, add to branch protection) only once it is clean or a
-  baseline is agreed. The advisory pylint baseline needs a decision (cleanup or
-  an agreed `--fail-under`) before promotion — surface it, do not silently let
-  it ride.
-- **Pre-commit hooks exclude `data/`** — the frozen dataset's byte integrity is
-  load-bearing; do not let a formatter touch it.
-- **Concurrency** cancels superseded runs on the same ref, so a force-push to a
-  PR branch may show a cancelled prior run — not a failure.
-- **Pin tool versions** in CI and keep them in sync with `.pre-commit-config.yaml`.
-- **Watch the deprecation clock:** GitHub actions pinned to old Node majors
-  (e.g. `actions/checkout@v4`, `setup-python@v5`) have forced-migration dates.
-  Bump before the cutoff; surface the date to the human.
+- **Decide which jobs are REQUIRED** (gate merge; wired into branch protection)
+  versus **ADVISORY** (report without blocking, e.g. `continue-on-error: true`)
+  for the current state of the codebase. A full test run should almost always
+  be required; lint/style/security scanners are reasonable to run advisory
+  while a legacy codebase is brought clean, then promoted once a baseline is
+  agreed — surface that promotion decision to the human rather than letting it
+  ride indefinitely.
+- **Confirm the required job(s) actually exercise the code that matters** — the
+  real dependency install, the real interpreter/toolchain, any
+  hardware- or platform-specific path your test runner can exercise — rather
+  than a stub that always passes.
+- **Exclude frozen or byte-sensitive assets** (fixtures, frozen datasets, golden
+  files) from anything that reformats on commit — load-bearing byte integrity
+  should not be silently touched by a formatter.
+- **Concurrency settings** that cancel superseded runs on the same ref can make
+  a force-push show a cancelled prior run — don't mistake that for a failure.
+- **Pin tool/action versions** in CI and keep them in sync with any local
+  pre-commit/lint config.
+- **Watch the deprecation clock** on any pinned CI actions or runners with a
+  forced-migration date; bump before the cutoff and surface the date to the
+  human.
 
 ---
 
@@ -410,14 +424,22 @@ and changing repo visibility. When denied:
 
 ---
 
-## 12. Environment notes (this project; adapt for others)
+## 12. Environment notes (fill in for your project)
 
-- One GPU, one GPU job at a time; only extraction touches it. GPU work uses the
-  dedicated conda env; **CPU agents use per-worktree venvs** and never pip-install
-  into the GPU env.
-- `gh` is invoked by full path on Windows: `"C:\Program Files\GitHub CLI\gh.exe"`.
-- Windows / PowerShell host: redirect to `$env:TEMP`, not `/dev/null`; use
-  `Start-Process`, not `&`-backgrounding, for detached jobs.
+This section is a placeholder — replace it with the constraints of your own
+setup before running the skill for real. Worth capturing here:
+
+- **Shared or scarce hardware.** If agents share a GPU, a license seat, a
+  rate-limited API key, or any other resource that can't be used by two jobs
+  at once, say so explicitly and name which agent role is allowed to touch it.
+- **Environment isolation rules.** Which environments are shared and must
+  never be mutated ad hoc, versus which are per-worktree and disposable.
+- **CLI tools invoked by full path.** On some hosts a tool isn't on `PATH` for
+  a spawned agent's shell; note the exact invocation if so.
+- **OS/shell quirks for detached jobs.** Where to redirect output on your
+  platform (a temp directory, `/dev/null`, etc.) and which launch mechanism
+  actually detaches on your host (e.g. `Start-Process` on Windows, `nohup ... &`
+  on POSIX).
 
 ---
 
